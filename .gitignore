@@ -132,3 +132,7 @@ dmypy.json
 *.DS_Store
 .DS_Store
 *.idea/
+
+# Don't upload training record
+
+allen_nlp_tutorial/*record/
