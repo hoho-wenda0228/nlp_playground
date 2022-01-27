@@ -25,14 +25,17 @@ from allennlp.training.gradient_descent_trainer import GradientDescentTrainer
 from allennlp.training.optimizers import AdamOptimizer
 from allennlp.training.metrics import CategoricalAccuracy
 
+from IPython import embed
 
+
+@DatasetReader.register("classification-tsv")
 class ClassificationTsvReader(DatasetReader):
     def __init__(
-        self,
-        tokenizer: Tokenizer = None,
-        token_indexers: Dict[str, TokenIndexer] = None,
-        max_tokens: int = None,
-        **kwargs
+            self,
+            tokenizer: Tokenizer = None,
+            token_indexers: Dict[str, TokenIndexer] = None,
+            max_tokens: int = None,
+            **kwargs
     ):
         super().__init__(**kwargs)
         self.tokenizer = tokenizer or WhitespaceTokenizer()
@@ -51,9 +54,10 @@ class ClassificationTsvReader(DatasetReader):
                 yield Instance({"text": text_field, "label": label_field})
 
 
+@Model.register("simple_classifier")
 class SimpleClassifier(Model):
     def __init__(
-        self, vocab: Vocabulary, embedder: TextFieldEmbedder, encoder: Seq2VecEncoder
+            self, vocab: Vocabulary, embedder: TextFieldEmbedder, encoder: Seq2VecEncoder
     ):
         super().__init__(vocab)
         self.embedder = embedder
@@ -62,7 +66,7 @@ class SimpleClassifier(Model):
         self.classifier = torch.nn.Linear(encoder.get_output_dim(), num_labels)
 
     def forward(
-        self, text: TextFieldTensors, label: torch.Tensor
+            self, text: TextFieldTensors, label: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         # Shape: (batch_size, num_tokens, embedding_dim)
         embedded_text = self.embedder(text)
@@ -76,6 +80,7 @@ class SimpleClassifier(Model):
         probs = torch.nn.functional.softmax(logits, dim=-1)
         # Shape: (1,)
         loss = torch.nn.functional.cross_entropy(logits, label)
+        embed()
         return {"loss": loss, "probs": probs}
 
 
@@ -116,6 +121,9 @@ def run_training_loop():
     train_loader, dev_loader = build_data_loaders(train_data, dev_data)
     train_loader.index_with(vocab)
     dev_loader.index_with(vocab)
+    for i in dev_loader:
+        print(i)
+    embed()
 
     serialization_dir = "train_record"
     trainer = build_trainer(model, serialization_dir, train_loader, dev_loader)
@@ -127,8 +135,8 @@ def run_training_loop():
 
 
 def build_data_loaders(
-    train_data: List[Instance],
-    dev_data: List[Instance],
+        train_data: List[Instance],
+        dev_data: List[Instance],
 ) -> Tuple[DataLoader, DataLoader]:
     train_loader = SimpleDataLoader(train_data, 8, shuffle=True)
     dev_loader = SimpleDataLoader(dev_data, 8, shuffle=False)
@@ -136,10 +144,10 @@ def build_data_loaders(
 
 
 def build_trainer(
-    model: Model,
-    serialization_dir: str,
-    train_loader: DataLoader,
-    dev_loader: DataLoader,
+        model: Model,
+        serialization_dir: str,
+        train_loader: DataLoader,
+        dev_loader: DataLoader,
 ) -> Trainer:
     parameters = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     optimizer = AdamOptimizer(parameters)  # type: ignore

@@ -1,6 +1,8 @@
 import os
 import sys
 
+from allennlp.data.samplers import BucketBatchSampler
+
 kmnlp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(kmnlp_dir)
 
@@ -17,8 +19,8 @@ from allennlp.data import (
     Vocabulary,
     TextFieldTensors,
 )
-from allennlp.data.data_loaders import SimpleDataLoader
-from allennlp.data.fields import LabelField, TextField
+from allennlp.data.data_loaders import MultiProcessDataLoader
+from allennlp.data.fields import TextField, SequenceLabelField, MultiLabelField
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
 from allennlp.data.tokenizers import Token, Tokenizer, WhitespaceTokenizer
 from allennlp.models import Model
@@ -31,6 +33,8 @@ from allennlp.training.trainer import Trainer
 from allennlp.training.gradient_descent_trainer import GradientDescentTrainer
 from allennlp.training.optimizers import AdamOptimizer
 from allennlp.training.metrics import CategoricalAccuracy
+
+from IPython import embed
 
 
 class NestedNERTsvReader(DatasetReader):
@@ -53,9 +57,11 @@ class NestedNERTsvReader(DatasetReader):
                     continue
 
                 try:
-                    text, bd, entity = line.strip().split('\t')
+                    text, bd, entity = line.split('\t')
+                    bd = bd.strip().split()
+                    entity = entity.strip().split()
                 except Exception as ex:
-                    print(line.strip().split('\t'))
+                    print(line.split('\t'))
                     print(ex)
 
                 tokens = self.tokenizer.tokenize(text)
@@ -64,8 +70,8 @@ class NestedNERTsvReader(DatasetReader):
                     tokens = tokens[:self.max_tokens]
 
                 text_field = TextField(tokens, self.token_indexers)
-                bd_label_field = LabelField(bd)
-                entity_label_field = LabelField(entity)
+                bd_label_field = SequenceLabelField(bd, text_field)
+                entity_label_field = MultiLabelField(entity)
                 yield Instance(
                     {"text": text_field, "bd_label": bd_label_field, "entity_label_field": entity_label_field})
 
@@ -135,12 +141,18 @@ def build_vocab(instances: Iterable[Instance]) -> Vocabulary:
     return Vocabulary.from_instances(instances)
 
 
-
-
 if __name__ == '__main__':
-    reader = NestedNERTsvReader()
+    reader = NestedNERTsvReader(max_tokens=128)
     file_path = "../datasets/CMeEE/dev.tsv"
-    reader._read(file_path)
-    c = []
-    for i in reader._read(file_path):
-        c.append(i)
+
+    """vocab = Vocabulary(padding_token="[PAD]", oov_token="[UNK]")
+    vocab.set_from_file("zh_vocab.txt")"""
+
+    vocab = Vocabulary.from_instances(reader.read(file_path))
+
+    data_loader = MultiProcessDataLoader(reader, file_path,
+                                         batch_sampler=BucketBatchSampler(batch_size=4, sorting_keys=["text"]))
+
+    data_loader.index_with(vocab)
+    for batch in data_loader:
+        print(batch)
