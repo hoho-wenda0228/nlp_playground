@@ -13,7 +13,7 @@ from allennlp.data import (
 from allennlp.data.data_loaders import SimpleDataLoader
 from allennlp.data.fields import LabelField, TextField
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
-from allennlp.data.tokenizers import Token, Tokenizer, WhitespaceTokenizer
+from allennlp.data.tokenizers import Token, Tokenizer, WhitespaceTokenizer, PretrainedTransformerTokenizer
 from allennlp.models import Model
 from allennlp.modules import TextFieldEmbedder, Seq2VecEncoder
 from allennlp.modules.seq2vec_encoders import BagOfEmbeddingsEncoder
@@ -164,3 +164,5 @@ def build_trainer(
 
 
 run_training_loop()
+
+

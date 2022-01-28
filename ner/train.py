@@ -1,10 +1,16 @@
 import os
 import sys
+import argparse
 
 from allennlp.data.samplers import BucketBatchSampler
+from transformers import BertTokenizerFast
 
 kmnlp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(kmnlp_dir)
+
+from kmnlp.layers import *
+from kmnlp.encoders import *
+from kmnlp.utils.config import load_hyperparam
 
 import tempfile
 from typing import Dict, Iterable, List, Tuple
@@ -78,20 +84,18 @@ class NestedNERTsvReader(DatasetReader):
 
 class NestedNERClassifier(Model):
     def __init__(
-            self, vocab: Vocabulary, embedder: TextFieldEmbedder, encoder: Seq2VecEncoder
+            self, embedder: TextFieldEmbedder, encoder: Seq2VecEncoder
     ):
         super().__init__(vocab)
-        self.embedder = embedder
+        self.embedding = embedder
         self.encoder = encoder
-        num_labels = vocab.get_vocab_size("labels")
-        self.classifier = torch.nn.Linear(encoder.get_output_dim(), num_labels)
 
     def forward(
             self, text: TextFieldTensors, bd_label: torch.Tensor, entity_label: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         print("In model.forward(); printing here just because binder is so slow")
         # Shape: (batch_size, num_tokens, embedding_dim)
-        embedded_text = self.embedder(text)
+        embedded_text = self.embedding(text)
         # Shape: (batch_size, num_tokens)
         mask = util.get_text_field_mask(text)
         # Shape: (batch_size, encoding_dim)
@@ -143,10 +147,7 @@ def build_vocab(instances: Iterable[Instance]) -> Vocabulary:
 
 if __name__ == '__main__':
     reader = NestedNERTsvReader(max_tokens=128)
-    file_path = "../datasets/CMeEE/dev.tsv"
-
-    """vocab = Vocabulary(padding_token="[PAD]", oov_token="[UNK]")
-    vocab.set_from_file("zh_vocab.txt")"""
+    file_path = "datasets/CMeEE/dev.tsv"
 
     vocab = Vocabulary.from_instances(reader.read(file_path))
 
@@ -154,5 +155,58 @@ if __name__ == '__main__':
                                          batch_sampler=BucketBatchSampler(batch_size=4, sorting_keys=["text"]))
 
     data_loader.index_with(vocab)
-    for batch in data_loader:
-        print(batch)
+
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    parser.add_argument("--config_path", default="models/kmbert/base_config.json", type=str,
+                        help="Path of the config file.")
+
+    parser.add_argument("--embedding", choices=["word", "word_pos", "word_pos_seg", "word_sinusoidalpos"],
+                        default="word_pos_seg",
+                        help="Emebdding type.")
+    parser.add_argument("--max_seq_length", type=int, default=512,
+                        help="Max sequence length for word embedding.")
+    parser.add_argument("--relative_position_embedding", action="store_true",
+                        help="Use relative position embedding.")
+    parser.add_argument("--relative_attention_buckets_num", type=int, default=32,
+                        help="Buckets num of relative position embedding.")
+    parser.add_argument("--remove_embedding_layernorm", action="store_true",
+                        help="Remove layernorm on embedding.")
+    parser.add_argument("--remove_attention_scale", action="store_true",
+                        help="Remove attention scale.")
+    parser.add_argument("--encoder", choices=["transformer", "rnn", "lstm", "gru",
+                                              "birnn", "bilstm", "bigru",
+                                              "gatedcnn"],
+                        default="transformer", help="Encoder type.")
+    parser.add_argument("--mask", choices=["fully_visible", "causal", "causal_with_prefix"], default="fully_visible",
+                        help="Mask type.")
+    parser.add_argument("--layernorm_positioning", choices=["pre", "post"], default="post",
+                        help="Layernorm positioning.")
+    parser.add_argument("--feed_forward", choices=["dense", "gated"], default="dense",
+                        help="Feed forward type, specific to transformer model.")
+    parser.add_argument("--remove_transformer_bias", action="store_true",
+                        help="Remove bias on transformer layers.")
+    parser.add_argument("--layernorm", choices=["normal", "t5"], default="normal",
+                        help="Layernorm type.")
+    parser.add_argument("--bidirectional", action="store_true", help="Specific to recurrent model.")
+    parser.add_argument("--factorized_embedding_parameterization", action="store_true",
+                        help="Factorized embedding parameterization.")
+    parser.add_argument("--parameter_sharing", action="store_true", help="Parameter sharing.")
+    parser.add_argument("--has_residual_attention", action="store_true", help="Add residual attention.")
+    parser.add_argument("--last4layer", action="store_true",
+                        help="Using the sum of last four layers of BERT as the embeddings")
+
+    args = parser.parse_args()
+
+    # Load the hyperparameters of the config file.
+    args = load_hyperparam(args)
+
+    args.tokenizer = BertTokenizerFast(vocab_file="models/zh_vocab.txt")
+
+    embedding = str2embedding[args.embedding](args, len(args.tokenizer.get_vocab()))
+
+    encoding = str2encoder[args.encoder](args)
+
+    model = NestedNERClassifier(embedder=embedding, encoder=encoding)
+    model.load_state_dict(torch.load("models/kmbert/kmbert_base.bin", map_location=torch.device('cpu')), strict=False)
+    embed()

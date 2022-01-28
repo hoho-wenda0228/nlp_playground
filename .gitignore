@@ -136,3 +136,7 @@ dmypy.json
 # Don't upload training record
 
 allen_nlp_tutorial/*record/
+
+# Don't upload pre-trained model
+models/
+kmnlp/
