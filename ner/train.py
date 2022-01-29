@@ -2,15 +2,9 @@ import os
 import sys
 import argparse
 
-from allennlp.data.samplers import BucketBatchSampler
-from transformers import BertTokenizerFast
-
-kmnlp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(kmnlp_dir)
-
-from kmnlp.layers import *
+"""from kmnlp.layers import *
 from kmnlp.encoders import *
-from kmnlp.utils.config import load_hyperparam
+from kmnlp.utils.config import load_hyperparam"""
 
 import tempfile
 from typing import Dict, Iterable, List, Tuple
@@ -26,9 +20,10 @@ from allennlp.data import (
     TextFieldTensors,
 )
 from allennlp.data.data_loaders import MultiProcessDataLoader
-from allennlp.data.fields import TextField, SequenceLabelField, MultiLabelField
+from allennlp.data.fields import TextField
+from allennlp.data.samplers import BucketBatchSampler
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
-from allennlp.data.tokenizers import Token, Tokenizer, WhitespaceTokenizer
+from allennlp.data.tokenizers import Token, Tokenizer, WhitespaceTokenizer, PretrainedTransformerTokenizer
 from allennlp.models import Model
 from allennlp.modules import TextFieldEmbedder, Seq2VecEncoder
 from allennlp.modules.seq2vec_encoders import BagOfEmbeddingsEncoder
@@ -48,12 +43,16 @@ class NestedNERTsvReader(DatasetReader):
             self,
             tokenizer: Tokenizer = None,
             token_indexers: Dict[str, TokenIndexer] = None,
+            bd_indexers: Dict[str, TokenIndexer] = None,
+            entity_indexers: Dict[str, TokenIndexer] = None,
             max_tokens: int = None,
             **kwargs
     ):
         super().__init__(**kwargs)
         self.tokenizer = tokenizer or WhitespaceTokenizer()
-        self.token_indexers = token_indexers or {"tokens": SingleIdTokenIndexer()}
+        self.token_indexers = token_indexers or {"tokens": SingleIdTokenIndexer(namespace="text")}
+        self.bd_indexers = bd_indexers or {"tokens": SingleIdTokenIndexer(namespace="bd")}
+        self.entity_indexers = entity_indexers or {"tokens": SingleIdTokenIndexer(namespace="entity")}
         self.max_tokens = max_tokens
 
     def _read(self, file_path: str) -> Iterable[Instance]:
@@ -64,27 +63,28 @@ class NestedNERTsvReader(DatasetReader):
 
                 try:
                     text, bd, entity = line.split('\t')
-                    bd = bd.strip().split()
-                    entity = entity.strip().split()
                 except Exception as ex:
                     print(line.split('\t'))
                     print(ex)
 
-                tokens = self.tokenizer.tokenize(text)
+                text_tokens = self.tokenizer.tokenize(text)
+                bd_tokens = self.tokenizer.tokenize(bd)
+                entity_tokens = self.tokenizer.tokenize(entity)
 
                 if self.max_tokens:
-                    tokens = tokens[:self.max_tokens]
+                    text_tokens = text_tokens[:self.max_tokens]
 
-                text_field = TextField(tokens, self.token_indexers)
-                bd_label_field = SequenceLabelField(bd, text_field)
-                entity_label_field = MultiLabelField(entity)
+                text_field = TextField(text_tokens, self.token_indexers)
+                bd_label_field = TextField(bd_tokens, self.bd_indexers)
+                entity_label_field = TextField(entity_tokens, self.entity_indexers)
+
                 yield Instance(
-                    {"text": text_field, "bd_label": bd_label_field, "entity_label_field": entity_label_field})
+                    {"text": text_field, "bd_label": bd_label_field, "entity_label": entity_label_field})
 
 
 class NestedNERClassifier(Model):
     def __init__(
-            self, embedder: TextFieldEmbedder, encoder: Seq2VecEncoder
+            self, vocab: Vocabulary, embedder: TextFieldEmbedder, encoder: Seq2VecEncoder
     ):
         super().__init__(vocab)
         self.embedding = embedder
@@ -146,16 +146,50 @@ def build_vocab(instances: Iterable[Instance]) -> Vocabulary:
 
 
 if __name__ == '__main__':
-    reader = NestedNERTsvReader(max_tokens=128)
-    file_path = "datasets/CMeEE/dev.tsv"
+    file_path = "../datasets/CMeEE/dev.tsv"
 
-    vocab = Vocabulary.from_instances(reader.read(file_path))
+    text_vocab_path = "../models/zh_vocab.txt"
+
+    bd_label_vocab_path = "../models/bd_label.txt"
+
+    entity_label_vocab_path = "../models/entity_label.txt"
+
+    white_tokenizer = WhitespaceTokenizer()
+
+    sentence = "金 域 量 言 , hello !"
+    print(sentence)
+
+    tokenized_sentence = white_tokenizer.tokenize(sentence)
+
+    print(tokenized_sentence)
+
+    # data reader
+    reader = NestedNERTsvReader(max_tokens=128)
 
     data_loader = MultiProcessDataLoader(reader, file_path,
                                          batch_sampler=BucketBatchSampler(batch_size=4, sorting_keys=["text"]))
 
+    vocab = Vocabulary(oov_token='[UNK]', padding_token='[PAD]')
+
+    vocab.set_from_file(text_vocab_path, is_padded=False, namespace="text")
+    vocab.set_from_file(bd_label_vocab_path, is_padded=False, namespace="bd")
+    vocab.set_from_file(entity_label_vocab_path, is_padded=False, namespace="entity")
+
     data_loader.index_with(vocab)
 
+    tokens = white_tokenizer.tokenize(sentence)
+
+    text_field = TextField(tokens, {"tokens":SingleIdTokenIndexer(namespace="text")})
+    text_field.index(vocab)
+
+    padding_lengths = text_field.get_padding_lengths()
+
+    tensor_dict = text_field.as_tensor(padding_lengths)
+    print(tensor_dict)
+
+
+
+"""    # parameter loading for model initialization
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument("--config_path", default="models/kmbert/base_config.json", type=str,
@@ -203,10 +237,11 @@ if __name__ == '__main__':
 
     args.tokenizer = BertTokenizerFast(vocab_file="models/zh_vocab.txt")
 
+    # model building
     embedding = str2embedding[args.embedding](args, len(args.tokenizer.get_vocab()))
 
     encoding = str2encoder[args.encoder](args)
 
     model = NestedNERClassifier(embedder=embedding, encoder=encoding)
     model.load_state_dict(torch.load("models/kmbert/kmbert_base.bin", map_location=torch.device('cpu')), strict=False)
-    embed()
+"""
