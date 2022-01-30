@@ -2,9 +2,14 @@ import os
 import sys
 import argparse
 
-"""from kmnlp.layers import *
+from transformers import BertTokenizerFast
+
+kmnlp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(kmnlp_dir)
+
+from kmnlp.layers import *
 from kmnlp.encoders import *
-from kmnlp.utils.config import load_hyperparam"""
+from kmnlp.utils.config import load_hyperparam
 
 import tempfile
 from typing import Dict, Iterable, List, Tuple
@@ -21,7 +26,7 @@ from allennlp.data import (
     TextFieldTensors,
 )
 from allennlp.data.data_loaders import MultiProcessDataLoader
-from allennlp.data.fields import TextField, MetadataField
+from allennlp.data.fields import TextField, MetadataField, TensorField
 from allennlp.data.samplers import BucketBatchSampler
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
 from allennlp.data.tokenizers import Token, Tokenizer, WhitespaceTokenizer, PretrainedTransformerTokenizer
@@ -95,8 +100,8 @@ class NestedNERTsvReader(DatasetReader):
         entity_tensor = torch.tensor(indexed_entity, dtype=torch.long)
         seg_tensor = torch.tensor(seg, dtype=torch.long)
 
-        return Instance({"text": MetadataField(text_tensor), "boundary": MetadataField(boundary_tensor),
-                         "entity": MetadataField(entity_tensor), "seg": MetadataField(seg_tensor)})
+        return Instance({"text_batch": TensorField(text_tensor), "bd_label_batch": TensorField(boundary_tensor),
+                         "entity_label_batch": MetadataField(entity_tensor), "seg_batch": TensorField(seg_tensor)})
 
     @staticmethod
     def initial_vocab():
@@ -143,11 +148,11 @@ class RegionCLF(nn.Module):
 def generate_region(boundary_label: list) -> List[Tuple[int, int]]:
     region_list = []
 
-    begin_label = "B"
-    middle_label = "M"
-    end_label = "E"
-    single_label = "S"
-    out_label = "O"
+    begin_label = 0
+    middle_label = 1
+    end_label = 2
+    single_label = 3
+    out_label = 4
 
     for start_idx, head in enumerate(boundary_label):
         if head == single_label or head == begin_label:
@@ -203,7 +208,7 @@ class NestedNERClassifier(Model):
 
             for word_repr, bd_label, entity_label in zip(word_repr_batch, bd_label_batch, entity_label_batch):
                 region = generate_region(bd_label.tolist())
-                flat_entity_label.append(entity_label)
+                flat_entity_label.extend(entity_label.tolist())
                 for (start, end) in region:
                     entity_emb.append(word_repr[start:end + 1])
 
@@ -271,54 +276,31 @@ def build_vocab(instances: Iterable[Instance]) -> Vocabulary:
     return Vocabulary.from_instances(instances)
 
 
-if __name__ == '__main__':
-    file_path = "../datasets/CMeEE/dev.tsv"
+def build_trainer(
+        model: Model,
+        serialization_dir: str,
+        train_loader: DataLoader,
+        dev_loader: DataLoader,
+) -> Trainer:
+    parameters = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    optimizer = AdamOptimizer(parameters)  # type: ignore
+    trainer = GradientDescentTrainer(
+        model=model,
+        serialization_dir=serialization_dir,
+        data_loader=train_loader,
+        validation_data_loader=dev_loader,
+        num_epochs=5,
+        optimizer=optimizer,
+        cuda_device=-1,
+    )
+    return trainer
 
-    text_vocab_path = "../models/zh_vocab.txt"
 
-    bd_label_vocab_path = "../models/bd_label.txt"
-
-    entity_label_vocab_path = "../models/entity_label.txt"
-
-    white_tokenizer = WhitespaceTokenizer()
-
-    sentence = "金 域 量 言 , hello !"
-    print(sentence)
-
-    tokenized_sentence = white_tokenizer.tokenize(sentence)
-
-    print(tokenized_sentence)
-
-    # data reader
-    reader = NestedNERTsvReader(max_tokens=128)
-
-    data_loader = MultiProcessDataLoader(reader, file_path,
-                                         batch_sampler=BucketBatchSampler(batch_size=4, sorting_keys=["text"]))
-
-    vocab = Vocabulary(oov_token='[UNK]', padding_token='[PAD]')
-
-    vocab.set_from_file(text_vocab_path, is_padded=False, namespace="text")
-    vocab.set_from_file(bd_label_vocab_path, is_padded=False, namespace="boundary")
-    vocab.set_from_file(entity_label_vocab_path, is_padded=False, namespace="entity")
-
-    data_loader.index_with(vocab)
-    for i in data_loader:
-        print(i)
-
-    tokens = white_tokenizer.tokenize(sentence)
-
-    text_field = TextField(tokens, {"tokens": SingleIdTokenIndexer(namespace="text")})
-    text_field.index(vocab)
-
-    padding_lengths = text_field.get_padding_lengths()
-
-    tensor_dict = text_field.as_tensor(padding_lengths)
-    print(tensor_dict)
-
-"""    # parameter loading for model initialization
+def intial_args():
+    # parameter loading for model initialization
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    parser.add_argument("--config_path", default="models/kmbert/base_config.json", type=str,
+    parser.add_argument("--config_path", default="../models/kmbert/base_config.json", type=str,
                         help="Path of the config file.")
 
     parser.add_argument("--embedding", choices=["word", "word_pos", "word_pos_seg", "word_sinusoidalpos"],
@@ -357,17 +339,54 @@ if __name__ == '__main__':
                         help="Using the sum of last four layers of BERT as the embeddings")
 
     args = parser.parse_args()
+    return args
 
+
+if __name__ == '__main__':
+    train_file_path = "../datasets/CMeEE/train.tsv"
+    dev_file_path = "../datasets/CMeEE/dev.tsv"
+
+    text_vocab_path = "../models/zh_vocab.txt"
+
+    bd_label_vocab_path = "../models/bd_label.txt"
+
+    entity_label_vocab_path = "../models/entity_label.txt"
+
+    # initial vocab
+    vocab = Vocabulary(oov_token='[UNK]', padding_token='[PAD]')
+
+    vocab.set_from_file(text_vocab_path, is_padded=False, namespace="text")
+    vocab.set_from_file(bd_label_vocab_path, is_padded=False, namespace="boundary")
+    vocab.set_from_file(entity_label_vocab_path, is_padded=False, namespace="entity")
+
+    # data reader
+    reader = NestedNERTsvReader(max_tokens=128)
+
+    train_data_loader = MultiProcessDataLoader(
+        reader, train_file_path, batch_sampler=BucketBatchSampler(batch_size=4, sorting_keys=["text_batch"]))
+
+    dev_data_loader = MultiProcessDataLoader(
+        reader, dev_file_path, batch_sampler=BucketBatchSampler(batch_size=4, sorting_keys=["text_batch"]))
+
+    train_data_loader.index_with(vocab)
+    dev_data_loader.index_with(vocab)
+
+    args = intial_args()
     # Load the hyperparameters of the config file.
     args = load_hyperparam(args)
 
-    args.tokenizer = BertTokenizerFast(vocab_file="models/zh_vocab.txt")
+    args.tokenizer = BertTokenizerFast(vocab_file="../models/zh_vocab.txt")
 
     # model building
     embedding = str2embedding[args.embedding](args, len(args.tokenizer.get_vocab()))
 
     encoding = str2encoder[args.encoder](args)
 
-    model = NestedNERClassifier(embedder=embedding, encoder=encoding)
-    model.load_state_dict(torch.load("models/kmbert/kmbert_base.bin", map_location=torch.device('cpu')), strict=False)
-"""
+    model = NestedNERClassifier(args, vocab, embedder=embedding, encoder=encoding)
+    model.load_state_dict(torch.load("../models/kmbert/kmbert_base.bin", map_location=torch.device('cpu')),
+                          strict=False)
+
+    serialization_dir = "train_record"
+    trainer = build_trainer(model, serialization_dir, train_data_loader, dev_data_loader)
+    print("Starting training")
+    trainer.train()

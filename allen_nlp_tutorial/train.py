@@ -69,6 +69,7 @@ class SimpleClassifier(Model):
             self, text: TextFieldTensors, label: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         # Shape: (batch_size, num_tokens, embedding_dim)
+        embed()
         embedded_text = self.embedder(text)
         # Shape: (batch_size, num_tokens)
         mask = util.get_text_field_mask(text)
@@ -121,9 +122,7 @@ def run_training_loop():
     train_loader, dev_loader = build_data_loaders(train_data, dev_data)
     train_loader.index_with(vocab)
     dev_loader.index_with(vocab)
-    for i in dev_loader:
-        print(i)
-    embed()
+
 
     serialization_dir = "train_record"
     trainer = build_trainer(model, serialization_dir, train_loader, dev_loader)
