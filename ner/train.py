@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Tuple
 
 import allennlp
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from allennlp.data import (
     DataLoader,
@@ -20,7 +21,7 @@ from allennlp.data import (
     TextFieldTensors,
 )
 from allennlp.data.data_loaders import MultiProcessDataLoader
-from allennlp.data.fields import TextField
+from allennlp.data.fields import TextField, MetadataField
 from allennlp.data.samplers import BucketBatchSampler
 from allennlp.data.token_indexers import TokenIndexer, SingleIdTokenIndexer
 from allennlp.data.tokenizers import Token, Tokenizer, WhitespaceTokenizer, PretrainedTransformerTokenizer
@@ -43,90 +44,215 @@ class NestedNERTsvReader(DatasetReader):
             self,
             tokenizer: Tokenizer = None,
             token_indexers: Dict[str, TokenIndexer] = None,
-            bd_indexers: Dict[str, TokenIndexer] = None,
+            boundary_indexers: Dict[str, TokenIndexer] = None,
             entity_indexers: Dict[str, TokenIndexer] = None,
-            max_tokens: int = None,
+            max_tokens: int = 128,
             **kwargs
     ):
         super().__init__(**kwargs)
         self.tokenizer = tokenizer or WhitespaceTokenizer()
-        self.token_indexers = token_indexers or {"tokens": SingleIdTokenIndexer(namespace="text")}
-        self.bd_indexers = bd_indexers or {"tokens": SingleIdTokenIndexer(namespace="bd")}
-        self.entity_indexers = entity_indexers or {"tokens": SingleIdTokenIndexer(namespace="entity")}
         self.max_tokens = max_tokens
+        self.vocab = self.initial_vocab()
 
     def _read(self, file_path: str) -> Iterable[Instance]:
         with open(file_path, "r") as lines:
             for idx, line in enumerate(lines):
                 if idx == 0:
                     continue
-
                 try:
-                    text, bd, entity = line.split('\t')
+                    text, boundary, entity = line.split('\t')
                 except Exception as ex:
                     print(line.split('\t'))
                     print(ex)
+                    continue
+                instance = self.text_to_instance(text, boundary, entity)
+                if instance is not None:
+                    yield instance
 
-                text_tokens = self.tokenizer.tokenize(text)
-                bd_tokens = self.tokenizer.tokenize(bd)
-                entity_tokens = self.tokenizer.tokenize(entity)
+    def text_to_instance(self, text: str, boundary: str, entity: str) -> Instance:
 
-                if self.max_tokens:
-                    text_tokens = text_tokens[:self.max_tokens]
+        text_tokens = self.tokenizer.tokenize(text)[:self.max_tokens]
+        boundary_tokens = self.tokenizer.tokenize(boundary)[:self.max_tokens]
+        entity_tokens = self.tokenizer.tokenize(entity)
 
-                text_field = TextField(text_tokens, self.token_indexers)
-                bd_label_field = TextField(bd_tokens, self.bd_indexers)
-                entity_label_field = TextField(entity_tokens, self.entity_indexers)
+        text_field = TextField(text_tokens, {"text": SingleIdTokenIndexer(namespace="text")})
+        boundary_field = TextField(boundary_tokens, {"boundary": SingleIdTokenIndexer(namespace="boundary")})
+        entity_field = TextField(entity_tokens, {"entity": SingleIdTokenIndexer(namespace="entity")})
 
-                yield Instance(
-                    {"text": text_field, "bd_label": bd_label_field, "entity_label": entity_label_field})
+        indexed_text = self.get_token_index(text_tokens, "text")
+        indexed_boundary = self.get_token_index(boundary_tokens, "boundary")
+        indexed_entity = self.get_token_index(entity_tokens, "entity")
+
+        text_len = len(indexed_text)
+        seg = [1] * text_len
+        seg.extend([0] * (self.max_tokens - text_len))
+
+        indexed_text.extend([0] * (self.max_tokens - text_len))
+        indexed_boundary.extend([0] * (self.max_tokens - text_len))
+
+        text_tensor = torch.tensor(indexed_text, dtype=torch.long)
+        boundary_tensor = torch.tensor(indexed_boundary, dtype=torch.long)
+        entity_tensor = torch.tensor(indexed_entity, dtype=torch.long)
+        seg_tensor = torch.tensor(seg, dtype=torch.long)
+
+        return Instance({"text": MetadataField(text_tensor), "boundary": MetadataField(boundary_tensor),
+                         "entity": MetadataField(entity_tensor), "seg": MetadataField(seg_tensor)})
+
+    @staticmethod
+    def initial_vocab():
+        vocab = Vocabulary(oov_token='[UNK]', padding_token='[PAD]')
+
+        text_vocab_path = "../models/zh_vocab.txt"
+        bd_label_vocab_path = "../models/bd_label.txt"
+        entity_label_vocab_path = "../models/entity_label.txt"
+
+        vocab.set_from_file(text_vocab_path, is_padded=False, namespace="text")
+        vocab.set_from_file(bd_label_vocab_path, is_padded=False, namespace="boundary")
+        vocab.set_from_file(entity_label_vocab_path, is_padded=False, namespace="entity")
+        return vocab
+
+    def get_token_index(self, tokens: list, namespace: str):
+        text_field = TextField(tokens, {namespace: SingleIdTokenIndexer(namespace=namespace)})
+        text_field.index(self.vocab)
+        return text_field._indexed_tokens[namespace]["tokens"]
+
+
+class RegionCLF(nn.Module):
+    """
+    used for identifying which entity region belongs to
+    """
+
+    def __init__(self, hidden_size, n_classes):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.fc = nn.Linear(self.hidden_size, n_classes)
+
+    def forward(self, data_list):
+        """
+        Args:
+            data_list: num_region * [num_token * hidden_size]
+        Returns:
+            region_repr: [num_region * num_entity_type]
+        """
+        region_repr_list = [hidden.mean(dim=0).view(1, -1) for hidden in data_list]  # num_region * [1 * hidden_size]
+        region_repr = torch.cat(region_repr_list, dim=0)  # [num_region * hidden_size]
+
+        return self.fc(region_repr)  # [batch_size x n_classes]
+
+
+def generate_region(boundary_label: list) -> List[Tuple[int, int]]:
+    region_list = []
+
+    begin_label = "B"
+    middle_label = "M"
+    end_label = "E"
+    single_label = "S"
+    out_label = "O"
+
+    for start_idx, head in enumerate(boundary_label):
+        if head == single_label or head == begin_label:
+            # single entity
+            if head == single_label:
+                region_list.append((start_idx, start_idx))
+
+            # other entity
+            for end_idx, tail in enumerate(boundary_label[start_idx + 1:]):
+                if tail == single_label or tail == end_label:
+                    tail_idx = start_idx + 1 + end_idx
+                    region_list.append((start_idx, tail_idx))
+
+                elif tail == out_label:
+                    break
+
+    return region_list
 
 
 class NestedNERClassifier(Model):
     def __init__(
-            self, vocab: Vocabulary, embedder: TextFieldEmbedder, encoder: Seq2VecEncoder
+            self, args, vocab: Vocabulary, embedder: TextFieldEmbedder, encoder: Seq2VecEncoder
     ):
         super().__init__(vocab)
         self.embedding = embedder
         self.encoder = encoder
 
+        self.num_bd_label = 5
+        self.sentence_output_layer = nn.Linear(args.hidden_size, self.num_bd_label)
+
+        self.entity_clf = RegionCLF(
+            hidden_size=args.hidden_size,
+            n_classes=10,
+        )
+        self.criterion = nn.CrossEntropyLoss()
+        self.gamma = 0.3
+
     def forward(
-            self, text: TextFieldTensors, bd_label: torch.Tensor, entity_label: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        print("In model.forward(); printing here just because binder is so slow")
+            self, text_batch: torch.Tensor, seg_batch: torch.Tensor, bd_label_batch: torch.Tensor = None,
+            entity_label_batch: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         # Shape: (batch_size, num_tokens, embedding_dim)
-        embedded_text = self.embedding(text)
-        # Shape: (batch_size, num_tokens)
-        mask = util.get_text_field_mask(text)
+        emb_batch = self.embedding(text_batch, seg_batch)
         # Shape: (batch_size, encoding_dim)
-        encoded_text = self.encoder(embedded_text, mask)
-        # Shape: (batch_size, num_labels)
-        logits = self.classifier(encoded_text)
-        # Shape: (batch_size, num_labels)
-        probs = F.softmax(logits, dim=-1)
-        # Shape: (1,)
-        loss = F.cross_entropy(logits, bd_label)
-        return {"loss": loss, "probs": probs}
+        word_repr_batch = self.encoder(emb_batch, seg_batch)
 
-    @staticmethod
-    def generate_entity_embedding(sentence_label) -> List[Tuple[int, int]]:
-        # generate region label
-        label_region = []
-        for start_idx, head in enumerate(sentence_label):
-            if head == "S" or head == "B":
-                # single entity
-                if head == "S":
-                    label_region.append((start_idx, start_idx))
+        # task1: predict the boundary
+        # sentence_output for  B I O M S predicting
+        # batch_size, seq_len, 5
+        sentence_output = self.sentence_output_layer(word_repr_batch)
 
-                # other entity
-                for end_idx, tail in enumerate(sentence_label[start_idx + 1:]):
-                    if tail == "S" or tail == "E":
-                        tail_idx = start_idx + 1 + end_idx
-                        label_region.append((start_idx, tail_idx))
+        if bd_label_batch is not None:
+            entity_emb, flat_entity_label = [], []
 
-                    elif tail == "O":
-                        break
-        return label_region
+            for word_repr, bd_label, entity_label in zip(word_repr_batch, bd_label_batch, entity_label_batch):
+                region = generate_region(bd_label.tolist())
+                flat_entity_label.append(entity_label)
+                for (start, end) in region:
+                    entity_emb.append(word_repr[start:end + 1])
+
+            region_outputs = self.entity_clf(entity_emb)
+
+            # calculate the loss of region entity
+            truth_regions = torch.tensor(flat_entity_label).to(region_outputs.device)
+
+            entity_detection_loss = self.criterion(region_outputs, truth_regions)
+
+            # calculate the loss for boundary
+            bd_tgt = bd_label_batch.contiguous().view(-1, 1)
+
+            one_hot = torch.zeros(bd_tgt.size(0), self.num_bd_label). \
+                to(torch.device(bd_tgt.device)). \
+                scatter_(1, bd_tgt, 1.0)
+
+            sentence_output = sentence_output.contiguous().view(-1, self.num_bd_label)
+            numerator = -torch.sum(nn.LogSoftmax(dim=-1)(sentence_output) * one_hot, 1)
+
+            tgt_mask = seg_batch.contiguous().view(-1).float()
+            numerator = torch.sum(tgt_mask * numerator)
+            denominator = torch.sum(tgt_mask) + 1e-6
+            boundary_detection_loss = numerator / denominator
+
+            # sentence_output = sentence_output.transpose(1, 2)
+            # loss = self.criterion(sentence_output, bd_tgt)
+            loss = self.gamma * entity_detection_loss + (1 - self.gamma) * boundary_detection_loss
+
+            return {"loss": loss}
+
+        else:
+            bd_label_batch = torch.argmax(sentence_output, dim=2)
+
+            # get all compose of region
+            entity_emb = []  # token embeddings refer to region
+
+            for word_repr, bd_label in zip(word_repr_batch, bd_label_batch):
+                region = generate_region(bd_label.tolist())
+                for (start, end) in region:
+                    entity_emb.append(word_repr[start:end + 1])
+
+            # pred the entity type for each region
+            entity_pred = torch.tensor([])
+            if len(entity_emb) > 0:
+                entity_outputs = self.entity_clf(entity_emb)
+                entity_pred = torch.argmax(entity_outputs, dim=1).view(-1)
+
+            return {"bd_pred": bd_label_batch, "entity_pred": entity_pred}
 
 
 def build_dataset_reader() -> DatasetReader:
@@ -172,22 +298,22 @@ if __name__ == '__main__':
     vocab = Vocabulary(oov_token='[UNK]', padding_token='[PAD]')
 
     vocab.set_from_file(text_vocab_path, is_padded=False, namespace="text")
-    vocab.set_from_file(bd_label_vocab_path, is_padded=False, namespace="bd")
+    vocab.set_from_file(bd_label_vocab_path, is_padded=False, namespace="boundary")
     vocab.set_from_file(entity_label_vocab_path, is_padded=False, namespace="entity")
 
     data_loader.index_with(vocab)
+    for i in data_loader:
+        print(i)
 
     tokens = white_tokenizer.tokenize(sentence)
 
-    text_field = TextField(tokens, {"tokens":SingleIdTokenIndexer(namespace="text")})
+    text_field = TextField(tokens, {"tokens": SingleIdTokenIndexer(namespace="text")})
     text_field.index(vocab)
 
     padding_lengths = text_field.get_padding_lengths()
 
     tensor_dict = text_field.as_tensor(padding_lengths)
     print(tensor_dict)
-
-
 
 """    # parameter loading for model initialization
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)

@@ -100,8 +100,8 @@ def build_dataset_reader() -> DatasetReader:
 
 def read_data(reader: DatasetReader) -> Tuple[List[Instance], List[Instance]]:
     print("Reading data")
-    training_data = list(reader.read("quick_start/data/movie_review/train.tsv"))
-    validation_data = list(reader.read("quick_start/data/movie_review/dev.tsv"))
+    training_data = list(reader.read("data/movie_review/train.tsv"))
+    validation_data = list(reader.read("data/movie_review/dev.tsv"))
     return training_data, validation_data
 
 
