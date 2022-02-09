@@ -39,7 +39,7 @@ from allennlp.nn import util
 from allennlp.training.trainer import Trainer
 from allennlp.training.gradient_descent_trainer import GradientDescentTrainer
 from allennlp.training.optimizers import AdamOptimizer
-from allennlp.training.metrics import CategoricalAccuracy
+from allennlp.training.metrics import Metric, FBetaMeasure
 
 from IPython import embed
 
@@ -148,11 +148,11 @@ class RegionCLF(nn.Module):
 def generate_region(boundary_label: list) -> List[Tuple[int, int]]:
     region_list = []
 
-    begin_label = 0
-    middle_label = 1
-    end_label = 2
-    single_label = 3
-    out_label = 4
+    begin_label = 1
+    middle_label = 2
+    end_label = 3
+    single_label = 4
+    out_label = 0
 
     for start_idx, head in enumerate(boundary_label):
         if head == single_label or head == begin_label:
@@ -170,6 +170,73 @@ def generate_region(boundary_label: list) -> List[Tuple[int, int]]:
                     break
 
     return region_list
+
+
+class NERF1Measure:
+    def __init__(self):
+        self.tp = 0
+        self.fn = 0
+        self.fp = 0
+
+    def __call__(
+            self,
+            region_tgt_batch,
+            entity_tgt_batch,
+            region_pred_batch,
+            entity_pred_batch,
+    ):
+        entity_tgt_list, entity_pred_list = [], []
+        region_true_count, region_pred_count = 0, 0
+
+        for region_tgt, entity_tgt, region_pred, entity_pred in zip(region_tgt_batch, entity_tgt_batch,
+                                                                    region_pred_batch, entity_pred_batch):
+            # id2entity = lambda x: list(args.entity_dict.keys())[list(args.entity_dict.values()).index(x)]
+
+            region_tgt_dict = dict(zip(region_tgt, entity_tgt.tolist()))
+            region_pred_dict = dict(zip(region_pred, entity_pred.tolist()))
+
+            for region in region_tgt_dict:
+                true_label = region_tgt_dict[region]
+                pred_label = region_pred_dict[region] if region in region_pred_dict else 0
+                entity_tgt_list.append(true_label)
+                entity_pred_list.append(pred_label)
+            for region in region_pred_dict:
+                if region not in region_tgt_dict:
+                    entity_pred_list.append(region_pred_dict[region])
+                    entity_tgt_list.append(0)
+
+            if len(entity_tgt) > 0:
+                region_true_count += (entity_tgt > 0).sum().item()
+
+            if len(entity_pred) > 0:
+                region_pred_count += (entity_pred > 0).sum().item()
+
+        tp = 0
+        for pv, tv in zip(entity_pred_list, entity_tgt_list):
+            if pv == tv and pv != 0:
+                tp += 1
+
+        fp = region_pred_count - tp
+        fn = region_true_count - tp
+
+        self.tp += tp
+        self.fp += fp
+        self.fn += fn
+
+    def get_metric(self, reset: bool = False):
+        precision = 0 if self.tp + self.fp == 0 else self.tp / (self.tp + self.fp)
+        recall = 0 if self.tp + self.fn == 0 else self.tp / (self.tp + self.fn)
+        f1 = 0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+        print("get metric", {"precision": precision, "recall": recall, "f1": f1})
+        embed()
+        if reset:
+            self.reset()
+        return {"precision:": precision, "recall": recall, "f1": f1}
+
+    def reset(self):
+        self.tp = 0
+        self.fp = 0
+        self.fn = 0
 
 
 class NestedNERClassifier(Model):
@@ -190,6 +257,8 @@ class NestedNERClassifier(Model):
         self.criterion = nn.CrossEntropyLoss()
         self.gamma = 0.3
 
+        self.accuracy = NERF1Measure()
+
     def forward(
             self, text_batch: torch.Tensor, seg_batch: torch.Tensor, bd_label_batch: torch.Tensor = None,
             entity_label_batch: torch.Tensor = None) -> Dict[str, torch.Tensor]:
@@ -206,18 +275,15 @@ class NestedNERClassifier(Model):
         if bd_label_batch is not None:
             entity_emb, flat_entity_label = [], []
 
-            for word_repr, bd_label, entity_label in zip(word_repr_batch, bd_label_batch, entity_label_batch):
-                region = generate_region(bd_label.tolist())
-                flat_entity_label.extend(entity_label.tolist())
-                for (start, end) in region:
-                    entity_emb.append(word_repr[start:end + 1])
+            entity_logit, region_batch = self.generate_pred_region_by_boundary(word_repr_batch, bd_label_batch)
 
-            region_outputs = self.entity_clf(entity_emb)
+            for entity_label in entity_label_batch:
+                flat_entity_label.extend(entity_label.tolist())
 
             # calculate the loss of region entity
-            truth_regions = torch.tensor(flat_entity_label).to(region_outputs.device)
+            truth_regions = torch.tensor(flat_entity_label).to(entity_logit.device)
 
-            entity_detection_loss = self.criterion(region_outputs, truth_regions)
+            entity_detection_loss = self.criterion(entity_logit, truth_regions)
 
             # calculate the loss for boundary
             bd_tgt = bd_label_batch.contiguous().view(-1, 1)
@@ -226,8 +292,8 @@ class NestedNERClassifier(Model):
                 to(torch.device(bd_tgt.device)). \
                 scatter_(1, bd_tgt, 1.0)
 
-            sentence_output = sentence_output.contiguous().view(-1, self.num_bd_label)
-            numerator = -torch.sum(nn.LogSoftmax(dim=-1)(sentence_output) * one_hot, 1)
+            sentence_output_flat = sentence_output.contiguous().view(-1, self.num_bd_label)
+            numerator = -torch.sum(nn.LogSoftmax(dim=-1)(sentence_output_flat) * one_hot, 1)
 
             tgt_mask = seg_batch.contiguous().view(-1).float()
             numerator = torch.sum(tgt_mask * numerator)
@@ -235,29 +301,56 @@ class NestedNERClassifier(Model):
             boundary_detection_loss = numerator / denominator
 
             # sentence_output = sentence_output.transpose(1, 2)
-            # loss = self.criterion(sentence_output, bd_tgt)
+            # loss = self.criterion(sentence_output, bd_label_batch,seg_batch)
             loss = self.gamma * entity_detection_loss + (1 - self.gamma) * boundary_detection_loss
+
+            # evaluation
+            bd_pred_batch = torch.argmax(sentence_output, dim=2)
+            entity_pred_logit, region_pred_batch = self.generate_pred_region_by_boundary(word_repr_batch, bd_pred_batch)
+
+            entity_pred_flat = torch.argmax(entity_pred_logit, dim=1).view(-1) \
+                if entity_pred_logit is not None else torch.tensor([])
+
+            entity_pred_batch = []
+            for idx, region_pred in enumerate(region_pred_batch):
+                start = 0 if idx == 0 else len(entity_pred_batch[idx - 1])
+                end = len(region_pred) + start
+                entity_pred_batch.append(entity_pred_flat[start:end])
+
+            self.accuracy(region_batch, entity_label_batch, region_pred_batch, entity_pred_batch)
 
             return {"loss": loss}
 
         else:
             bd_label_batch = torch.argmax(sentence_output, dim=2)
 
-            # get all compose of region
-            entity_emb = []  # token embeddings refer to region
+            entity_logit, _ = self.generate_pred_region_by_boundary(word_repr_batch, bd_label_batch)
 
-            for word_repr, bd_label in zip(word_repr_batch, bd_label_batch):
-                region = generate_region(bd_label.tolist())
-                for (start, end) in region:
-                    entity_emb.append(word_repr[start:end + 1])
-
-            # pred the entity type for each region
-            entity_pred = torch.tensor([])
-            if len(entity_emb) > 0:
-                entity_outputs = self.entity_clf(entity_emb)
-                entity_pred = torch.argmax(entity_outputs, dim=1).view(-1)
+            entity_pred = torch.argmax(entity_logit, dim=1).view(-1) if entity_logit is not None else torch.tensor([])
 
             return {"bd_pred": bd_label_batch, "entity_pred": entity_pred}
+
+    def generate_pred_region_by_boundary(self, word_repr_batch, bd_label_batch):
+        # get all compose of region
+        entity_emb = []  # token embeddings refer to region
+
+        region_batch = []
+
+        for word_repr, bd_label in zip(word_repr_batch, bd_label_batch):
+            region = generate_region(bd_label.tolist())
+            region_batch.append(region)
+            for (start, end) in region:
+                entity_emb.append(word_repr[start:end + 1])
+
+        # pred the entity type for each region
+        entity_logit = None
+        if len(entity_emb) > 0:
+            entity_logit = self.entity_clf(entity_emb)
+
+        return entity_logit, region_batch
+
+    def get_metrics(self, reset: bool = False) -> dict[str, dict[str, float]]:
+        return {"accuracy": self.accuracy.get_metric(reset)}
 
 
 def build_dataset_reader() -> DatasetReader:
@@ -390,3 +483,4 @@ if __name__ == '__main__':
     trainer = build_trainer(model, serialization_dir, train_data_loader, dev_data_loader)
     print("Starting training")
     trainer.train()
+    print("Finished training")

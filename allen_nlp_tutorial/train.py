@@ -69,7 +69,6 @@ class SimpleClassifier(Model):
             self, text: TextFieldTensors, label: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         # Shape: (batch_size, num_tokens, embedding_dim)
-        embed()
         embedded_text = self.embedder(text)
         # Shape: (batch_size, num_tokens)
         mask = util.get_text_field_mask(text)
@@ -81,7 +80,7 @@ class SimpleClassifier(Model):
         probs = torch.nn.functional.softmax(logits, dim=-1)
         # Shape: (1,)
         loss = torch.nn.functional.cross_entropy(logits, label)
-        embed()
+
         return {"loss": loss, "probs": probs}
 
 
