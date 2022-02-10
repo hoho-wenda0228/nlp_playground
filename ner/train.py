@@ -1,29 +1,32 @@
 import os
+import random
+import shutil
+
+import numpy
+import optuna
 import sys
 import argparse
 
 from transformers import BertTokenizerFast
 
+
 kmnlp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(kmnlp_dir)
 
 from kmnlp.layers import *
 from kmnlp.encoders import *
 from kmnlp.utils.config import load_hyperparam
 
-import tempfile
 from typing import Dict, Iterable, List, Tuple
 
-import allennlp
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from allennlp.data import (
     DataLoader,
     DatasetReader,
     Instance,
     Vocabulary,
-    TextFieldTensors,
 )
 from allennlp.data.data_loaders import MultiProcessDataLoader
 from allennlp.data.fields import TextField, MetadataField, TensorField
@@ -39,9 +42,15 @@ from allennlp.nn import util
 from allennlp.training.trainer import Trainer
 from allennlp.training.gradient_descent_trainer import GradientDescentTrainer
 from allennlp.training.optimizers import AdamOptimizer
-from allennlp.training.metrics import Metric, FBetaMeasure
+from allennlp.training.util import evaluate
+
+
+
+TARGET_METRIC = "f1"
 
 from IPython import embed
+
+DEVICE = -1  # If you want to use GPU, use DEVICE = 0.
 
 
 class NestedNERTsvReader(DatasetReader):
@@ -224,14 +233,15 @@ class NERF1Measure:
         self.fn += fn
 
     def get_metric(self, reset: bool = False):
+
         precision = 0 if self.tp + self.fp == 0 else self.tp / (self.tp + self.fp)
         recall = 0 if self.tp + self.fn == 0 else self.tp / (self.tp + self.fn)
         f1 = 0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
-        print("get metric", {"precision": precision, "recall": recall, "f1": f1})
-        embed()
+        all_metrics = {"precision": precision, "recall": recall, "f1": f1}
         if reset:
             self.reset()
-        return {"precision:": precision, "recall": recall, "f1": f1}
+
+        return all_metrics
 
     def reset(self):
         self.tp = 0
@@ -349,8 +359,8 @@ class NestedNERClassifier(Model):
 
         return entity_logit, region_batch
 
-    def get_metrics(self, reset: bool = False) -> dict[str, dict[str, float]]:
-        return {"accuracy": self.accuracy.get_metric(reset)}
+    def get_metrics(self, reset: bool = False) -> dict[str, float]:
+        return self.accuracy.get_metric(reset)
 
 
 def build_dataset_reader() -> DatasetReader:
@@ -436,8 +446,10 @@ def intial_args():
 
 
 if __name__ == '__main__':
+    print("hahahahah")
     train_file_path = "../datasets/CMeEE/train.tsv"
     dev_file_path = "../datasets/CMeEE/dev.tsv"
+    test_file_path = "../datasets/CMeEE/test.tsv"
 
     text_vocab_path = "../models/zh_vocab.txt"
 
@@ -459,7 +471,7 @@ if __name__ == '__main__':
         reader, train_file_path, batch_sampler=BucketBatchSampler(batch_size=4, sorting_keys=["text_batch"]))
 
     dev_data_loader = MultiProcessDataLoader(
-        reader, dev_file_path, batch_sampler=BucketBatchSampler(batch_size=4, sorting_keys=["text_batch"]))
+        reader, train_file_path, batch_sampler=BucketBatchSampler(batch_size=4, sorting_keys=["text_batch"]))
 
     train_data_loader.index_with(vocab)
     dev_data_loader.index_with(vocab)
@@ -470,17 +482,78 @@ if __name__ == '__main__':
 
     args.tokenizer = BertTokenizerFast(vocab_file="../models/zh_vocab.txt")
 
-    # model building
-    embedding = str2embedding[args.embedding](args, len(args.tokenizer.get_vocab()))
 
-    encoding = str2encoder[args.encoder](args)
+    def create_model(global_args):
+        # model building
+        embedding = str2embedding[global_args.embedding](global_args, len(global_args.tokenizer.get_vocab()))
 
-    model = NestedNERClassifier(args, vocab, embedder=embedding, encoder=encoding)
-    model.load_state_dict(torch.load("../models/kmbert/kmbert_base.bin", map_location=torch.device('cpu')),
-                          strict=False)
+        encoding = str2encoder[global_args.encoder](global_args)
+
+        model = NestedNERClassifier(global_args, vocab, embedder=embedding, encoder=encoding)
+        model.load_state_dict(torch.load("../models/kmbert/kmbert_base.bin", map_location=torch.device('cpu')),
+                              strict=False)
+        return model
+
 
     serialization_dir = "train_record"
-    trainer = build_trainer(model, serialization_dir, train_data_loader, dev_data_loader)
+
+    model = create_model(args)
+
+
+    def objective(trial):
+        if DEVICE > -1:
+            model.to(torch.device("cuda:{}".format(DEVICE)))
+
+        lr = trial.suggest_float("lr", 1e-3, 1e-5, log=True)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+
+        serialization_dir = os.path.join("ner_record", "trial_{}".format(trial.number))
+        trainer = GradientDescentTrainer(
+            model=model,
+            optimizer=optimizer,
+            data_loader=train_data_loader,
+            validation_data_loader=dev_data_loader,
+            validation_metric="+" + TARGET_METRIC,
+            patience=None,  # `patience=None` since it could conflict with AllenNLPPruningCallback
+            num_epochs=30,
+            cuda_device=DEVICE,
+            serialization_dir=serialization_dir,
+        )
+        print("Starting training")
+        metrics = trainer.train()
+        print("Finished training")
+        return metrics["best_validation_" + TARGET_METRIC]
+
+
+    """trainer = build_trainer(model, serialization_dir, train_data_loader, dev_data_loader)
     print("Starting training")
     trainer.train()
-    print("Finished training")
+    print("Finished training")"""
+
+    random.seed(41)
+    torch.manual_seed(41)
+    numpy.random.seed(41)
+
+    pruner = optuna.pruners.HyperbandPruner()
+    print("HERE!")
+    study = optuna.create_study(direction="maximize", pruner=pruner)
+    study.optimize(objective, n_trials=50, timeout=600)
+
+    print("Number of finished trials: ", len(study.trials))
+    print("Best trial:")
+    trial = study.best_trial
+
+    print("  Value: ", trial.value)
+    print("  Params: ")
+    for key, value in trial.params.items():
+        print("    {}: {}".format(key, value))
+
+    shutil.rmtree("ner_record")
+
+    # Now we can evaluate the model on a new dataset.
+    test_data_loader = MultiProcessDataLoader(
+        reader, test_file_path, batch_sampler=BucketBatchSampler(batch_size=4, sorting_keys=["text_batch"]))
+
+    test_data_loader.index_with(vocab)
+
+    results = evaluate(model, test_data_loader)
