@@ -9,7 +9,6 @@ import argparse
 
 from transformers import BertTokenizerFast
 
-
 kmnlp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(kmnlp_dir)
@@ -43,8 +42,6 @@ from allennlp.training.trainer import Trainer
 from allennlp.training.gradient_descent_trainer import GradientDescentTrainer
 from allennlp.training.optimizers import AdamOptimizer
 from allennlp.training.util import evaluate
-
-
 
 TARGET_METRIC = "f1"
 
@@ -504,7 +501,7 @@ if __name__ == '__main__':
         if DEVICE > -1:
             model.to(torch.device("cuda:{}".format(DEVICE)))
 
-        lr = trial.suggest_float("lr", 1e-3, 1e-5, log=True)
+        lr = trial.suggest_float("lr", 1e-5, 1e-4, log=True)
         optimizer = torch.optim.SGD(model.parameters(), lr=lr)
 
         serialization_dir = os.path.join("ner_record", "trial_{}".format(trial.number))
@@ -513,11 +510,10 @@ if __name__ == '__main__':
             optimizer=optimizer,
             data_loader=train_data_loader,
             validation_data_loader=dev_data_loader,
-            validation_metric="+" + TARGET_METRIC,
             patience=None,  # `patience=None` since it could conflict with AllenNLPPruningCallback
-            num_epochs=30,
+            num_epochs=1,
             cuda_device=DEVICE,
-            serialization_dir=serialization_dir,
+            serialization_dir="ner_record",
         )
         print("Starting training")
         metrics = trainer.train()
@@ -537,7 +533,7 @@ if __name__ == '__main__':
     pruner = optuna.pruners.HyperbandPruner()
     print("HERE!")
     study = optuna.create_study(direction="maximize", pruner=pruner)
-    study.optimize(objective, n_trials=50, timeout=600)
+    study.optimize(objective, n_trials=3, timeout=600)
 
     print("Number of finished trials: ", len(study.trials))
     print("Best trial:")
