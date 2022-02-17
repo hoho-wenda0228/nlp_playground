@@ -1,0 +1,21 @@
+ARG CUDA=11.2-ubuntu20.04
+FROM ghcr.io/allenai/cuda:${CUDA}
+
+LABEL maintainer="Manda"
+
+ARG user=KMNER
+
+RUN apt-get update && apt-get install -y build-essential
+
+COPY . /home/$user
+
+WORKDIR /home/$user
+
+# please write your dependencies in requirements.txt
+RUN python3 -m pip install --upgrade pip && python3 -m pip install -r requirements.txt
+
+# set working dir
+WORKDIR /home/$user
+
+ENV LANG C.UTF-8
+ENV LC_ALL C.UTF-8

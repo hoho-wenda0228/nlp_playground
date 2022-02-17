@@ -45,9 +45,12 @@ from allennlp.training.util import evaluate
 
 TARGET_METRIC = "f1"
 
-from IPython import embed
-
 DEVICE = -1  # If you want to use GPU, use DEVICE = 0.
+IS_DISTRIBUTED = False
+if (type(DEVICE) == list) and (len(DEVICE) > 1):
+    IS_DISTRIBUTED = True
+
+MODEL_DIR = "./train_record"
 
 
 class NestedNERTsvReader(DatasetReader):
@@ -113,9 +116,9 @@ class NestedNERTsvReader(DatasetReader):
     def initial_vocab():
         vocab = Vocabulary(oov_token='[UNK]', padding_token='[PAD]')
 
-        text_vocab_path = "../models/zh_vocab.txt"
-        bd_label_vocab_path = "../models/bd_label.txt"
-        entity_label_vocab_path = "../models/entity_label.txt"
+        text_vocab_path = "models/zh_vocab.txt"
+        bd_label_vocab_path = "models/bd_label.txt"
+        entity_label_vocab_path = "models/entity_label.txt"
 
         vocab.set_from_file(text_vocab_path, is_padded=False, namespace="text")
         vocab.set_from_file(bd_label_vocab_path, is_padded=False, namespace="boundary")
@@ -366,8 +369,8 @@ def build_dataset_reader() -> DatasetReader:
 
 def read_data(reader: DatasetReader) -> Tuple[List[Instance], List[Instance]]:
     print("Reading data")
-    training_data = list(reader.read("../datasets/CMeEE/train.tsv"))
-    validation_data = list(reader.read("../datasets/CMeEE/dev.tsv"))
+    training_data = list(reader.read("datasets/CMeEE/train.tsv"))
+    validation_data = list(reader.read("datasets/CMeEE/dev.tsv"))
     return training_data, validation_data
 
 
@@ -400,7 +403,7 @@ def intial_args():
     # parameter loading for model initialization
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    parser.add_argument("--config_path", default="../models/kmbert/base_config.json", type=str,
+    parser.add_argument("--config_path", default="models/kmbert/base_config.json", type=str,
                         help="Path of the config file.")
 
     parser.add_argument("--embedding", choices=["word", "word_pos", "word_pos_seg", "word_sinusoidalpos"],
@@ -443,16 +446,15 @@ def intial_args():
 
 
 if __name__ == '__main__':
-    print("hahahahah")
-    train_file_path = "../datasets/CMeEE/train.tsv"
-    dev_file_path = "../datasets/CMeEE/dev.tsv"
-    test_file_path = "../datasets/CMeEE/test.tsv"
+    train_file_path = "datasets/CMeEE/train.tsv"
+    dev_file_path = "datasets/CMeEE/dev.tsv"
+    test_file_path = "datasets/CMeEE/test.tsv"
 
-    text_vocab_path = "../models/zh_vocab.txt"
+    text_vocab_path = "models/zh_vocab.txt"
 
-    bd_label_vocab_path = "../models/bd_label.txt"
+    bd_label_vocab_path = "models/bd_label.txt"
 
-    entity_label_vocab_path = "../models/entity_label.txt"
+    entity_label_vocab_path = "models/entity_label.txt"
 
     # initial vocab
     vocab = Vocabulary(oov_token='[UNK]', padding_token='[PAD]')
@@ -468,7 +470,7 @@ if __name__ == '__main__':
         reader, train_file_path, batch_sampler=BucketBatchSampler(batch_size=4, sorting_keys=["text_batch"]))
 
     dev_data_loader = MultiProcessDataLoader(
-        reader, train_file_path, batch_sampler=BucketBatchSampler(batch_size=4, sorting_keys=["text_batch"]))
+        reader, dev_file_path, batch_sampler=BucketBatchSampler(batch_size=4, sorting_keys=["text_batch"]))
 
     train_data_loader.index_with(vocab)
     dev_data_loader.index_with(vocab)
@@ -477,7 +479,7 @@ if __name__ == '__main__':
     # Load the hyperparameters of the config file.
     args = load_hyperparam(args)
 
-    args.tokenizer = BertTokenizerFast(vocab_file="../models/zh_vocab.txt")
+    args.tokenizer = BertTokenizerFast(vocab_file="models/zh_vocab.txt")
 
 
     def create_model(global_args):
@@ -487,24 +489,22 @@ if __name__ == '__main__':
         encoding = str2encoder[global_args.encoder](global_args)
 
         model = NestedNERClassifier(global_args, vocab, embedder=embedding, encoder=encoding)
-        model.load_state_dict(torch.load("../models/kmbert/kmbert_base.bin", map_location=torch.device('cpu')),
+        model.load_state_dict(torch.load("models/kmbert/kmbert_base.bin", map_location=torch.device('cpu')),
                               strict=False)
         return model
 
-
-    serialization_dir = "train_record"
 
     model = create_model(args)
 
 
     def objective(trial):
-        if DEVICE > -1:
-            model.to(torch.device("cuda:{}".format(DEVICE)))
+        """if DEVICE > -1:
+            model.to(torch.device("cuda:{}".format(DEVICE)))"""
 
         lr = trial.suggest_float("lr", 1e-5, 1e-4, log=True)
         optimizer = torch.optim.SGD(model.parameters(), lr=lr)
 
-        serialization_dir = os.path.join("ner_record", "trial_{}".format(trial.number))
+        serialization_dir = os.path.join(MODEL_DIR, "trial_{}".format(trial.number))
         trainer = GradientDescentTrainer(
             model=model,
             optimizer=optimizer,
@@ -513,7 +513,8 @@ if __name__ == '__main__':
             patience=None,  # `patience=None` since it could conflict with AllenNLPPruningCallback
             num_epochs=1,
             cuda_device=DEVICE,
-            serialization_dir="ner_record",
+            serialization_dir=serialization_dir,
+            distributed=IS_DISTRIBUTED
         )
         print("Starting training")
         metrics = trainer.train()
@@ -535,6 +536,14 @@ if __name__ == '__main__':
     study = optuna.create_study(direction="maximize", pruner=pruner)
     study.optimize(objective, n_trials=3, timeout=600)
 
+    # save model
+    model_save_path = "./best_model.bin"
+    if hasattr(model, "module"):
+        torch.save(model.module.state_dict(), model_save_path)
+    else:
+        torch.save(model.state_dict(), model_save_path)
+    print("model saved to {}".format(model_save_path))
+
     print("Number of finished trials: ", len(study.trials))
     print("Best trial:")
     trial = study.best_trial
@@ -544,7 +553,7 @@ if __name__ == '__main__':
     for key, value in trial.params.items():
         print("    {}: {}".format(key, value))
 
-    shutil.rmtree("ner_record")
+    # shutil.rmtree(MODEL_DIR)
 
     # Now we can evaluate the model on a new dataset.
     test_data_loader = MultiProcessDataLoader(

@@ -12,7 +12,7 @@ sys.path.append(kmnlp_dir)
 
 
 
-tokenizer = BertTokenizerFast(vocab_file="../models/zh_vocab.txt")
+tokenizer = BertTokenizerFast(vocab_file="models/zh_vocab.txt")
 
 sentence = "金 域量言, 你好!"
 print(sentence)
@@ -25,6 +25,6 @@ ids = tokenizer.convert_tokens_to_ids(tokenized_sentence)
 
 bert_ids = tokenizer.encode_plus(sentence, add_special_tokens=False, return_offsets_mapping=True)
 
-config = AutoConfig.from_pretrained("../models/kmbert/base_config.json")
+config = AutoConfig.from_pretrained("models/kmbert/base_config.json")
 
 
